@@ -242,9 +242,8 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     # and creates a transaction that holds the item for ~15 minutes.
     url = f"{VINTED_BASE}/api/v2/item_transactions"
     body = {"transaction": {"item_id": int(item_id), "transaction_id": None}}
-
-    try:
-            resp = session.post(
+  try:
+          resp = session.post(
               url,
               json=body,
               headers=_vinted_headers(csrf),
