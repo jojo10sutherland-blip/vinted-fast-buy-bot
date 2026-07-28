@@ -143,6 +143,8 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     url = f"{VINTED_BASE}/api/v2/item_transactions"
     body = {"transaction": {"item_id": int(item_id), "transaction_id": None}}
 
+    logger.info("Sending reserve request to %s with body %s", url, body)
+
     try:
         resp = session.post(
             url,
@@ -152,6 +154,13 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
         )
     except requests.exceptions.RequestException as exc:
         return False, f"Network error: {exc}"
+
+    # Always log the raw response so we can debug
+    logger.info(
+        "Vinted response: status=%s, body=%s",
+        resp.status_code,
+        resp.text[:500],
+    )
 
     if resp.status_code in (200, 201):
         try:
