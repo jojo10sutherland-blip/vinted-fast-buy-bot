@@ -1,9 +1,11 @@
 {
-  "$schema": "https://railway.com/railway.schema.json",
-  "build": { "builder": "NIXPACKS" },
+  "$schema": "https://railway.app/railway.schema.json",
+  "build": {
+    "builder": "NIXPACKS"
+  },
   "deploy": {
-    "startCommand": "python fast_buy_bot.py",
-    "restartPolicyType": "ALWAYS",
+    "startCommand": "python -u fast_buy_bot.py",
+    "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
 }
