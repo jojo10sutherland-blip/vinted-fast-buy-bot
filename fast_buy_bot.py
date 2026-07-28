@@ -77,45 +77,137 @@ def _vinted_headers(csrf: Optional[str] = None) -> dict:
 
 
 def _vinted_cookies() -> dict:
-    """The minimum cookies required for an authenticated Vinted request."""
-    c = {"_vinted_fr_session": VINTED_SESSION_COOKIE}
+    """
+    Cookies required for an authenticated Vinted request.
+
+    Two modes:
+      (a) If VINTED_COOKIES env var is set, parse it as a whole cookie
+          header string (semicolon-separated `name=value` pairs — the
+          format you can copy from browser DevTools → Network → any
+          request → Request Headers → Cookie).  This is the MOST
+          RELIABLE way because it captures every cookie Vinted needs,
+          including `cf_clearance` (Cloudflare) and any others.
+      (b) Otherwise fall back to individual env vars:
+          VINTED_SESSION_COOKIE + optional VINTED_ANON_ID +
+          optional VINTED_CF_CLEARANCE.
+    """
+    raw = os.environ.get("VINTED_COOKIES", "").strip()
+    if raw:
+        cookies: dict = {}
+        for pair in raw.split(";"):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            name, _, value = pair.partition("=")
+            if not name.strip():
+                continue
+            cookies[name.strip()] = value.strip()
+        return cookies
+
+    # Fallback — individual vars
+    c: dict = {}
+    if VINTED_SESSION_COOKIE:
+        c["_vinted_fr_session"] = VINTED_SESSION_COOKIE
     if VINTED_ANON_ID:
         c["anon_id"] = VINTED_ANON_ID
+    cf = os.environ.get("VINTED_CF_CLEARANCE", "").strip()
+    if cf:
+        c["cf_clearance"] = cf
     return c
 
 
 def _fetch_csrf(session: requests.Session) -> Optional[str]:
     """
-    Hit /api/v2/users/current to (a) verify our session cookie still works
-    and (b) grab a fresh CSRF token from the response headers.
+    Hit /api/v2/users/current to (a) verify our session cookies still work
+    and (b) grab a fresh CSRF token.  Checks headers, response body, and
+    Set-Cookie values (Vinted's CSRF location has moved around over time).
+
     Returns the CSRF token or None on failure.
     """
+    cookies = _vinted_cookies()
+    if not cookies:
+        logger.warning("No Vinted cookies configured — set VINTED_COOKIES or VINTED_SESSION_COOKIE.")
+        return None
+
+    logger.info(
+        "Fetching CSRF from Vinted with %d cookie(s): %s",
+        len(cookies), sorted(cookies.keys()),
+    )
+
     try:
         resp = session.get(
             f"{VINTED_BASE}/api/v2/users/current",
             headers=_vinted_headers(),
-            cookies=_vinted_cookies(),
+            cookies=cookies,
             timeout=10,
         )
-        if resp.status_code != 200:
-            logger.warning(
-                "CSRF fetch: /users/current returned %d (session cookie may be expired). Body: %s",
-                resp.status_code, resp.text[:200],
-            )
-            return None
-        # Vinted returns the CSRF token in a `x-csrf-token` response header
-        # OR embedded in the user JSON as `csrf_token` (varies by year).
-        csrf = resp.headers.get("x-csrf-token") or resp.headers.get("X-CSRF-Token")
-        if not csrf:
-            try:
-                body = resp.json()
-                csrf = (body.get("user") or {}).get("csrf_token") or body.get("csrf_token")
-            except ValueError:
-                csrf = None
-        return csrf
     except requests.exceptions.RequestException as exc:
-        logger.warning("CSRF fetch failed with network error: %s", exc)
+        logger.warning("CSRF fetch network error: %s", exc)
         return None
+
+    logger.info(
+        "CSRF fetch: status=%d, content-type=%s, body-len=%d",
+        resp.status_code,
+        resp.headers.get("content-type", ""),
+        len(resp.content),
+    )
+
+    # ── Handle non-200 responses ─────────────────────────────────────
+    if resp.status_code != 200:
+        body_preview = resp.text[:400]
+        logger.warning("CSRF non-200: body preview: %s", body_preview)
+        if resp.status_code == 401:
+            logger.warning("→ 401 means your `_vinted_fr_session` cookie is expired or invalid.")
+        elif resp.status_code == 403:
+            if "cloudflare" in body_preview.lower() or "cf-ray" in resp.headers:
+                logger.warning(
+                    "→ 403 from Cloudflare — you need the cf_clearance cookie. "
+                    "Set VINTED_COOKIES with the full cookie header (recommended)."
+                )
+            else:
+                logger.warning("→ 403 — bot may be flagged, or CSRF mismatch.")
+        return None
+
+    # ── Try to extract the CSRF token from multiple locations ────────
+    # 1. Response headers (older Vinted API returned it here)
+    csrf = resp.headers.get("x-csrf-token") or resp.headers.get("X-CSRF-Token")
+    if csrf:
+        logger.debug("CSRF found in response header")
+        return csrf
+
+    # 2. Response body — user.csrf_token / csrf_token / csrfToken
+    try:
+        body = resp.json()
+        csrf = (
+            (body.get("user") or {}).get("csrf_token")
+            or body.get("csrf_token")
+            or body.get("csrfToken")
+        )
+        if csrf:
+            logger.debug("CSRF found in response JSON body")
+            return csrf
+    except ValueError:
+        pass
+
+    # 3. Set-Cookie — Vinted sometimes rotates CSRF via a cookie
+    for cookie_name in ("_vinted_fr_anti_csrf", "csrf_token", "X-CSRF-Token"):
+        val = resp.cookies.get(cookie_name)
+        if val:
+            logger.debug("CSRF found in Set-Cookie (%s)", cookie_name)
+            return val
+
+    # 4. HTML meta tag (if we somehow landed on the HTML page)
+    if "text/html" in resp.headers.get("content-type", ""):
+        m = re.search(r'name="csrf-token"[^>]*content="([^"]+)"', resp.text)
+        if m:
+            logger.debug("CSRF found in HTML meta tag")
+            return m.group(1)
+
+    logger.warning(
+        "Could not find CSRF token anywhere. Response headers: %s. Body preview: %s",
+        dict(resp.headers), resp.text[:300],
+    )
+    return None
 
 
 def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
@@ -128,16 +220,21 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     changed their API, the returned message will include the raw response
     so you can adjust the endpoint.
     """
-    if not VINTED_SESSION_COOKIE:
-        return False, "VINTED_SESSION_COOKIE env var is not set."
+    if not VINTED_SESSION_COOKIE and not os.environ.get("VINTED_COOKIES"):
+        return False, (
+            "❌ Vinted cookies not configured on Railway. Set either "
+            "`VINTED_COOKIES` (recommended — paste full Cookie header) "
+            "or `VINTED_SESSION_COOKIE`."
+        )
 
     session = requests.Session()
     csrf = _fetch_csrf(session)
     if not csrf:
         return False, (
-            "Could not fetch CSRF token from Vinted. Your `_vinted_fr_session` "
-            "cookie has probably expired — log into vinted.co.uk in your "
-            "browser again and copy the new cookie value into Railway."
+            "❌ Could not authenticate with Vinted. Likely causes:\n"
+            "• Your session cookie expired — log into vinted.co.uk in your browser again\n"
+            "• Cloudflare blocked us — you need to send the full cookie header (set `VINTED_COOKIES` env var)\n"
+            "\nCheck the Railway Deploy Logs for exact HTTP status + body from Vinted."
         )
 
     # Vinted's "single checkout" endpoint — starts the buy flow for one item
