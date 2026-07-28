@@ -1,3 +1,4 @@
+print("=== FAST BUY BOT STARTING ===", flush=True)
 """
 fast_buy_bot.py
 ---------------
