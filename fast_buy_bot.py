@@ -244,11 +244,10 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     body = {"transaction": {"item_id": int(item_id), "transaction_id": None}}
 
     try:
-        resp = session.post(
+     resp = session.post(
             url,
             json=body,
             headers=_vinted_headers(csrf),
-            cookies=_vinted_cookies(),
             timeout=15,
         )
     except requests.exceptions.RequestException as exc:
