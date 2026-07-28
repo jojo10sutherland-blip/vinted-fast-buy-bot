@@ -115,14 +115,11 @@ def _vinted_cookies() -> dict:
         c["cf_clearance"] = cf
     return c
 
-
 def _fetch_csrf(session: requests.Session) -> Optional[str]:
     """
-    Hit /api/v2/users/current to (a) verify our session cookies still work
-    and (b) grab a fresh CSRF token.  Checks headers, response body, and
-    Set-Cookie values (Vinted's CSRF location has moved around over time).
-
-    Returns the CSRF token or None on failure.
+    Fetch a fresh CSRF token by loading an HTML page (homepage).
+    Vinted embeds the token in <meta name="csrf-token"> or in a
+    "CSRF_TOKEN" JS variable — never in the pure JSON /users/current endpoint.
     """
     cookies = _vinted_cookies()
     if not cookies:
@@ -134,12 +131,17 @@ def _fetch_csrf(session: requests.Session) -> Optional[str]:
         len(cookies), sorted(cookies.keys()),
     )
 
+    # 1. Hit the HTML homepage so we get the CSRF token
     try:
         resp = session.get(
-            f"{VINTED_BASE}/api/v2/users/current",
-            headers=_vinted_headers(),
+            f"{VINTED_BASE}/",                     # ← HTML page, not /api/...
+            headers={
+                **_vinted_headers(),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
             cookies=cookies,
-            timeout=10,
+            timeout=12,
+            allow_redirects=True,
         )
     except requests.exceptions.RequestException as exc:
         logger.warning("CSRF fetch network error: %s", exc)
@@ -152,63 +154,62 @@ def _fetch_csrf(session: requests.Session) -> Optional[str]:
         len(resp.content),
     )
 
-    # ── Handle non-200 responses ─────────────────────────────────────
     if resp.status_code != 200:
         body_preview = resp.text[:400]
         logger.warning("CSRF non-200: body preview: %s", body_preview)
         if resp.status_code == 401:
-            logger.warning("→ 401 means your `_vinted_fr_session` cookie is expired or invalid.")
+            logger.warning("→ 401 means your session cookie is expired or invalid.")
         elif resp.status_code == 403:
-            if "cloudflare" in body_preview.lower() or "cf-ray" in resp.headers:
-                logger.warning(
-                    "→ 403 from Cloudflare — you need the cf_clearance cookie. "
-                    "Set VINTED_COOKIES with the full cookie header (recommended)."
-                )
-            else:
-                logger.warning("→ 403 — bot may be flagged, or CSRF mismatch.")
+            logger.warning(
+                "→ 403 — Cloudflare/DataDome blocked us. "
+                "Paste the FULL Cookie header into VINTED_COOKIES."
+            )
         return None
 
-    # ── Try to extract the CSRF token from multiple locations ────────
-    # 1. Response headers (older Vinted API returned it here)
-    csrf = resp.headers.get("x-csrf-token") or resp.headers.get("X-CSRF-Token")
-    if csrf:
-        logger.debug("CSRF found in response header")
-        return csrf
+    html = resp.text
 
-    # 2. Response body — user.csrf_token / csrf_token / csrfToken
-    try:
-        body = resp.json()
-        csrf = (
-            (body.get("user") or {}).get("csrf_token")
-            or body.get("csrf_token")
-            or body.get("csrfToken")
-        )
-        if csrf:
-            logger.debug("CSRF found in response JSON body")
-            return csrf
-    except ValueError:
-        pass
+    # ── Extract CSRF from the HTML (try several common locations) ──
+    # 1. Modern meta tag
+    m = re.search(
+        r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
+        html, re.I,
+    )
+    if m:
+        logger.debug("CSRF found in <meta name=\"csrf-token\">")
+        return m.group(1)
 
-    # 3. Set-Cookie — Vinted sometimes rotates CSRF via a cookie
-    for cookie_name in ("_vinted_fr_anti_csrf", "csrf_token", "X-CSRF-Token"):
-        val = resp.cookies.get(cookie_name)
-        if val:
-            logger.debug("CSRF found in Set-Cookie (%s)", cookie_name)
-            return val
+    # 2. Older / alternate meta order
+    m = re.search(
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']csrf-token["\']',
+        html, re.I,
+    )
+    if m:
+        logger.debug("CSRF found in meta (content-first)")
+        return m.group(1)
 
-    # 4. HTML meta tag (if we somehow landed on the HTML page)
-    if "text/html" in resp.headers.get("content-type", ""):
-        m = re.search(r'name="csrf-token"[^>]*content="([^"]+)"', resp.text)
-        if m:
-            logger.debug("CSRF found in HTML meta tag")
-            return m.group(1)
+    # 3. JS variable style (still used by some Vinted locales)
+    m = re.search(r'["\']CSRF_TOKEN["\']\s*:\s*["\']([^"\']+)["\']', html)
+    if m:
+        logger.debug("CSRF found in CSRF_TOKEN JS variable")
+        return m.group(1)
+
+    # 4. Sometimes appears as window.csrfToken / similar
+    m = re.search(r'csrfToken["\']?\s*[:=]\s*["\']([^"\']+)["\']', html, re.I)
+    if m:
+        logger.debug("CSRF found in csrfToken variable")
+        return m.group(1)
+
+    # 5. Last-resort: any long-looking token near the word csrf
+    m = re.search(r'csrf[^"\']{0,20}["\']([A-Za-z0-9+/=_-]{20,})["\']', html, re.I)
+    if m:
+        logger.debug("CSRF found by broad regex")
+        return m.group(1)
 
     logger.warning(
-        "Could not find CSRF token anywhere. Response headers: %s. Body preview: %s",
-        dict(resp.headers), resp.text[:300],
+        "Could not find CSRF token in HTML. First 500 chars of body:\n%s",
+        html[:500],
     )
     return None
-
 
 def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     """
