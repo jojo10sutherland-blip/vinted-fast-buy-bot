@@ -250,8 +250,8 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
             headers=_vinted_headers(csrf),
             timeout=15,
         )
-    except requests.exceptions.RequestException as exc:
-        return False, f"Network error contacting Vinted: {exc}"
+        except requests.exceptions.RequestException as exc:
+            return False, f"Network error contacting Vinted: {exc}"
 
     # ── Parse the response ───────────────────────────────────────────────
     if resp.status_code in (200, 201):
