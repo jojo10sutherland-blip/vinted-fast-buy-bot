@@ -4,7 +4,6 @@ fast_buy_bot.py
 A standalone Discord bot that adds a "⚡ RESERVE NOW" button underneath
 every iPhone-deal alert your existing iPhone bot posts into a Discord
 channel — and reserves the Vinted item for you when you tap it.
-
 Design goals:
   1. ZERO changes required to your existing iPhone bot code.
   2. Runs as its own Railway service (separate process). If this bot
@@ -15,47 +14,42 @@ Design goals:
      environment variables — nothing sensitive is hard-coded.
   5. Extensive error reporting: if the Vinted API changes, you'll see
      exactly what came back in the button reply.
-
 Environment variables (required):
-  DISCORD_BOT_TOKEN        - from https://discord.com/developers/applications
-  DISCORD_CHANNEL_ID       - the Discord channel ID to watch (numeric)
-  VINTED_SESSION_COOKIE    - the `_vinted_fr_session` cookie value from
+  DISCORD_BOT_TOKEN - from https://discord.com/developers/applications
+  DISCORD_CHANNEL_ID - the Discord channel ID to watch (numeric)
+  VINTED_SESSION_COOKIE - the `_vinted_fr_session` cookie value from
                              your logged-in browser (see README)
-
 Optional:
-  VINTED_ANON_ID           - the `anon_id` cookie (improves auth reliability)
-  VINTED_USER_AGENT        - browser UA string to match your session cookie
-  LOG_LEVEL                - DEBUG / INFO (default INFO)
+  VINTED_ANON_ID - the `anon_id` cookie (improves auth reliability)
+  VINTED_USER_AGENT - browser UA string to match your session cookie
+  LOG_LEVEL - DEBUG / INFO (default INFO)
 """
-
 import asyncio
 import logging
 import os
 import re
 from typing import Optional
-
 import discord
 import requests
 
 # ─── configuration from env ──────────────────────────────────────────────────
-DISCORD_BOT_TOKEN     = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
-DISCORD_CHANNEL_ID    = int(os.environ.get("DISCORD_CHANNEL_ID", "0") or 0)
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+DISCORD_CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", "0") or 0)
 VINTED_SESSION_COOKIE = os.environ.get("VINTED_SESSION_COOKIE", "").strip()
-VINTED_ANON_ID        = os.environ.get("VINTED_ANON_ID", "").strip()
-VINTED_USER_AGENT     = os.environ.get(
+VINTED_ANON_ID = os.environ.get("VINTED_ANON_ID", "").strip()
+VINTED_USER_AGENT = os.environ.get(
     "VINTED_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ).strip()
-LOG_LEVEL             = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
     level=LOG_LEVEL,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    format="%(asctime)s %(levelname)-8s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("fast-buy-bot")
-
 
 # ─── Vinted client ───────────────────────────────────────────────────────────
 VINTED_BASE = "https://www.vinted.co.uk"
@@ -64,11 +58,11 @@ VINTED_BASE = "https://www.vinted.co.uk"
 def _vinted_headers(csrf: Optional[str] = None) -> dict:
     """Standard headers matching a real logged-in browser session."""
     h = {
-        "User-Agent":       VINTED_USER_AGENT,
-        "Accept":           "application/json, text/plain, */*",
-        "Accept-Language":  "en-GB,en;q=0.9",
-        "Referer":          f"{VINTED_BASE}/",
-        "Origin":           VINTED_BASE,
+        "User-Agent": VINTED_USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Referer": f"{VINTED_BASE}/",
+        "Origin": VINTED_BASE,
         "X-Requested-With": "XMLHttpRequest",
     }
     if csrf:
@@ -79,12 +73,11 @@ def _vinted_headers(csrf: Optional[str] = None) -> dict:
 def _vinted_cookies() -> dict:
     """
     Cookies required for an authenticated Vinted request.
-
     Two modes:
       (a) If VINTED_COOKIES env var is set, parse it as a whole cookie
           header string (semicolon-separated `name=value` pairs — the
           format you can copy from browser DevTools → Network → any
-          request → Request Headers → Cookie).  This is the MOST
+          request → Request Headers → Cookie). This is the MOST
           RELIABLE way because it captures every cookie Vinted needs,
           including `cf_clearance` (Cloudflare) and any others.
       (b) Otherwise fall back to individual env vars:
@@ -103,7 +96,6 @@ def _vinted_cookies() -> dict:
                 continue
             cookies[name.strip()] = value.strip()
         return cookies
-
     # Fallback — individual vars
     c: dict = {}
     if VINTED_SESSION_COOKIE:
@@ -114,6 +106,7 @@ def _vinted_cookies() -> dict:
     if cf:
         c["cf_clearance"] = cf
     return c
+
 
 def _fetch_csrf(session: requests.Session) -> Optional[str]:
     """
@@ -134,7 +127,7 @@ def _fetch_csrf(session: requests.Session) -> Optional[str]:
     # 1. Hit the HTML homepage so we get the CSRF token
     try:
         resp = session.get(
-            f"{VINTED_BASE}/",                     # ← HTML page, not /api/...
+            f"{VINTED_BASE}/",
             headers={
                 **_vinted_headers(),
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -211,12 +204,11 @@ def _fetch_csrf(session: requests.Session) -> Optional[str]:
     )
     return None
 
+
 def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     """
     Attempt to reserve a Vinted listing (put it in your cart / open checkout).
-
     Returns (success, human_readable_message).
-
     This tries the current Vinted UK checkout endpoint. If Vinted has
     changed their API, the returned message will include the raw response
     so you can adjust the endpoint.
@@ -242,15 +234,16 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     # and creates a transaction that holds the item for ~15 minutes.
     url = f"{VINTED_BASE}/api/v2/item_transactions"
     body = {"transaction": {"item_id": int(item_id), "transaction_id": None}}
-  try:
-          resp = session.post(
-              url,
-              json=body,
-              headers=_vinted_headers(csrf),
-              timeout=15,
-            )
-        except requests.exceptions.RequestException as exc:
-            return False, f"Network error contacting Vinted: {exc}" 
+
+    try:
+        resp = session.post(
+            url,
+            json=body,
+            headers=_vinted_headers(csrf),
+            timeout=15,
+        )
+    except requests.exceptions.RequestException as exc:
+        return False, f"Network error contacting Vinted: {exc}"
 
     # ── Parse the response ───────────────────────────────────────────────
     if resp.status_code in (200, 201):
@@ -262,7 +255,7 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
                 or "unknown"
             )
             return True, (
-                f"✅ Reserved!  Transaction id `{tx_id}`.\n"
+                f"✅ Reserved! Transaction id `{tx_id}`.\n"
                 f"Open the Vinted app → **Wallet & Purchases → Ongoing** "
                 f"and complete payment within ~15 minutes."
             )
@@ -299,8 +292,7 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
 
 # ─── Discord bot ─────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
-intents.message_content = True   # need this to read message content for URL parsing
-
+intents.message_content = True  # need this to read message content for URL parsing
 client = discord.Client(intents=intents)
 
 # Regex to extract the numeric Vinted listing ID from any URL that appears
@@ -379,7 +371,6 @@ def _extract_item_id(message: discord.Message) -> Optional[str]:
         for f in embed.fields:
             if hit := scan(f.value or ""):
                 return hit
-
     return None
 
 
@@ -391,10 +382,10 @@ def _build_listing_url(item_id: str) -> str:
 async def on_ready():
     logger.info("Fast-Buy bot logged in as %s (id=%s)", client.user, client.user.id)
     logger.info("Watching channel id: %s", DISCORD_CHANNEL_ID)
-    if not VINTED_SESSION_COOKIE:
+    if not VINTED_SESSION_COOKIE and not os.environ.get("VINTED_COOKIES"):
         logger.warning(
-            "VINTED_SESSION_COOKIE is not set — the RESERVE button will fail "
-            "until you add it to Railway env vars."
+            "No Vinted cookies set — the RESERVE button will fail "
+            "until you add VINTED_COOKIES or VINTED_SESSION_COOKIE to Railway env vars."
         )
 
 
@@ -437,7 +428,6 @@ def main() -> None:
         raise SystemExit("DISCORD_BOT_TOKEN env var is required.")
     if not DISCORD_CHANNEL_ID:
         raise SystemExit("DISCORD_CHANNEL_ID env var is required.")
-
     logger.info("Starting Fast-Buy bot…")
     client.run(DISCORD_BOT_TOKEN, log_handler=None)
 
