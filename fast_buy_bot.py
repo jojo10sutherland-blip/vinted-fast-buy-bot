@@ -135,26 +135,37 @@ def _fetch_csrf(session: requests.Session) -> Optional[str]:
 def _get_item_seller_id(session: requests.Session, item_id: str, csrf: str) -> Optional[str]:
     """Fetch item details to get the seller's user ID."""
     url = f"{VINTED_BASE}/api/v2/items/{item_id}"
+
     try:
         resp = session.get(
             url,
             headers=_vinted_headers(csrf),
             timeout=10,
         )
+
+        logger.info(
+            "Item fetch: status=%s, body preview=%s",
+            resp.status_code,
+            resp.text[:400],
+        )
+
         if resp.status_code != 200:
-            logger.warning("Failed to fetch item %s: status=%s", item_id, resp.status_code)
             return None
 
         data = resp.json()
-        # Seller ID is usually under item.user.id
-        user = (data.get("item") or {}).get("user") or {}
+
+        # Try multiple possible locations for the seller ID
+        item = data.get("item") or data
+        user = item.get("user") or {}
         seller_id = user.get("id")
+
         if seller_id:
             logger.info("Found seller_id=%s for item %s", seller_id, item_id)
             return str(seller_id)
 
-        logger.warning("Could not find seller id in item response")
+        logger.warning("Could not find seller id in item response. Keys: %s", list(data.keys()))
         return None
+
     except Exception as e:
         logger.warning("Error fetching item seller: %s", e)
         return None
