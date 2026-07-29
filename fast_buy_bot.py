@@ -133,42 +133,70 @@ def _fetch_csrf(session: requests.Session) -> Optional[str]:
 
 
 def _get_item_seller_id(session: requests.Session, item_id: str, csrf: str) -> Optional[str]:
-    """Fetch item details to get the seller's user ID."""
-    url = f"{VINTED_BASE}/api/v2/items/{item_id}"
+    """Fetch item details to get the seller's user ID. Tries multiple methods."""
 
+    # Method 1: API endpoints
+    urls_to_try = [
+        f"{VINTED_BASE}/api/v2/items/{item_id}",
+        f"{VINTED_BASE}/api/v2/items/{item_id}?localize=false",
+    ]
+
+    headers = _vinted_headers(csrf)
+    headers["Referer"] = f"{VINTED_BASE}/items/{item_id}"
+
+    for url in urls_to_try:
+        try:
+            resp = session.get(url, headers=headers, timeout=10)
+            logger.info(
+                "Item fetch (%s): status=%s, body preview=%s",
+                url, resp.status_code, resp.text[:250]
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                item = data.get("item") or data
+                user = item.get("user") or {}
+                seller_id = user.get("id")
+                if seller_id:
+                    logger.info("Found seller_id=%s for item %s", seller_id, item_id)
+                    return str(seller_id)
+        except Exception as e:
+            logger.warning("Error on %s: %s", url, e)
+
+    # Method 2: Scrape from the HTML page as fallback
     try:
+        logger.info("Trying to scrape seller ID from HTML page...")
         resp = session.get(
-            url,
-            headers=_vinted_headers(csrf),
-            timeout=10,
+            f"{VINTED_BASE}/items/{item_id}",
+            headers={
+                **_vinted_headers(),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": f"{VINTED_BASE}/",
+            },
+            timeout=12,
         )
+        if resp.status_code == 200:
+            # Look for seller ID patterns in the HTML
+            m = re.search(r'"user"\s*:\s*\{[^}]*"id"\s*:\s*(\d+)', resp.text)
+            if m:
+                seller_id = m.group(1)
+                logger.info("Found seller_id=%s from HTML scrape", seller_id)
+                return seller_id
 
-        logger.info(
-            "Item fetch: status=%s, body preview=%s",
-            resp.status_code,
-            resp.text[:400],
-        )
+            m = re.search(r'"seller_id"\s*:\s*(\d+)', resp.text)
+            if m:
+                return m.group(1)
 
-        if resp.status_code != 200:
-            return None
+            m = re.search(r'/member/(\d+)', resp.text)
+            if m:
+                logger.info("Found possible seller_id=%s from member link", m.group(1))
+                return m.group(1)
 
-        data = resp.json()
-
-        # Try multiple possible locations for the seller ID
-        item = data.get("item") or data
-        user = item.get("user") or {}
-        seller_id = user.get("id")
-
-        if seller_id:
-            logger.info("Found seller_id=%s for item %s", seller_id, item_id)
-            return str(seller_id)
-
-        logger.warning("Could not find seller id in item response. Keys: %s", list(data.keys()))
-        return None
-
+        logger.warning("HTML scrape also failed. Status=%s", resp.status_code)
     except Exception as e:
-        logger.warning("Error fetching item seller: %s", e)
-        return None
+        logger.warning("HTML scrape error: %s", e)
+
+    return None
 
 
 def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
@@ -191,7 +219,7 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     if not seller_id:
         return False, "❌ Could not get seller ID for this item."
 
-    # 2. Create the conversation / transaction (this is the real reserve step)
+    # 2. Create the conversation / transaction
     url = f"{VINTED_BASE}/api/v2/conversations"
     body = {
         "initiator": "buy",
