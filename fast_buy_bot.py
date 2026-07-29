@@ -11,6 +11,7 @@ import logging
 import os
 import re
 from typing import Optional
+
 import discord
 import requests
 
@@ -77,6 +78,7 @@ def _vinted_cookies() -> dict:
 
 
 def _fetch_csrf(session: requests.Session) -> Optional[str]:
+    # Prefer manually set token
     manual = os.environ.get("VINTED_CSRF_TOKEN", "").strip()
     if manual:
         logger.info("Using CSRF token from VINTED_CSRF_TOKEN env var")
@@ -136,6 +138,12 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
         return False, "❌ Vinted cookies not configured on Railway."
 
     session = requests.Session()
+
+    # ALWAYS put the cookies on the session first
+    cookies = _vinted_cookies()
+    if cookies:
+        session.cookies.update(cookies)
+
     csrf = _fetch_csrf(session)
     if not csrf:
         return False, "❌ Could not get CSRF token. Set VINTED_CSRF_TOKEN or check cookies."
@@ -144,6 +152,7 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     body = {"transaction": {"item_id": int(item_id), "transaction_id": None}}
 
     logger.info("Sending reserve request to %s with body %s", url, body)
+    logger.info("Cookies being sent: %s", list(session.cookies.keys()))
 
     try:
         resp = session.post(
@@ -152,34 +161,37 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
             headers=_vinted_headers(csrf),
             timeout=15,
         )
-    except requests.exceptions.RequestException as exc:
-        return False, f"Network error: {exc}"
+    except requests.exceptions.RequestException as e:
+        return False, f"Network error: {e}"
 
-    # Always log the raw response so we can debug
     logger.info(
-        "Vinted response: status=%s, body=%s",
+        "Vinted response: status=%s, content-type=%s, body=%s",
         resp.status_code,
-        resp.text[:500],
+        resp.headers.get("content-type", ""),
+        resp.text[:600],
     )
 
     if resp.status_code in (200, 201):
         try:
             data = resp.json()
             tx_id = (data.get("transaction") or {}).get("id") or data.get("id") or "unknown"
-            return True, f"✅ Reserved! Transaction id `{tx_id}`.\nOpen Vinted app → Wallet & Purchases → Ongoing and pay within ~15 min."
+            return True, (
+                f"✅ Reserved! Transaction id `{tx_id}`.\n"
+                "Open the Vinted app → **Wallet & Purchases → Ongoing** and pay within ~15 min."
+            )
         except ValueError:
             return True, "✅ Reserved (OK response)."
 
     if resp.status_code == 401:
-        return False, "❌ Session cookie rejected (401). Update your cookies."
+        return False, "❌ Session cookie rejected (401). Log in again and update cookies."
     if resp.status_code == 403:
-        return False, "❌ Forbidden (403). CSRF invalid or blocked."
+        return False, "❌ Forbidden (403). CSRF invalid or Cloudflare/DataDome blocked."
     if resp.status_code == 404:
-        return False, "❌ Item no longer available (404)."
+        return False, "❌ Endpoint returned 404 (item sold **or** wrong endpoint)."
     if resp.status_code == 409:
-        return False, "❌ Item already sold/reserved (409)."
+        return False, "❌ Item already sold/reserved by someone else (409)."
     if resp.status_code == 422:
-        return False, f"❌ Rejected (422): {resp.text[:250]}"
+        return False, f"❌ Rejected (422): {resp.text[:300]}"
     if resp.status_code == 429:
         return False, "❌ Rate limited (429)."
 
