@@ -78,7 +78,6 @@ def _vinted_cookies() -> dict:
 
 
 def _fetch_csrf(session: requests.Session) -> Optional[str]:
-    # Prefer manually set token
     manual = os.environ.get("VINTED_CSRF_TOKEN", "").strip()
     if manual:
         logger.info("Using CSRF token from VINTED_CSRF_TOKEN env var")
@@ -133,13 +132,41 @@ def _fetch_csrf(session: requests.Session) -> Optional[str]:
     return None
 
 
+def _get_item_seller_id(session: requests.Session, item_id: str, csrf: str) -> Optional[str]:
+    """Fetch item details to get the seller's user ID."""
+    url = f"{VINTED_BASE}/api/v2/items/{item_id}"
+    try:
+        resp = session.get(
+            url,
+            headers=_vinted_headers(csrf),
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            logger.warning("Failed to fetch item %s: status=%s", item_id, resp.status_code)
+            return None
+
+        data = resp.json()
+        # Seller ID is usually under item.user.id
+        user = (data.get("item") or {}).get("user") or {}
+        seller_id = user.get("id")
+        if seller_id:
+            logger.info("Found seller_id=%s for item %s", seller_id, item_id)
+            return str(seller_id)
+
+        logger.warning("Could not find seller id in item response")
+        return None
+    except Exception as e:
+        logger.warning("Error fetching item seller: %s", e)
+        return None
+
+
 def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     if not VINTED_SESSION_COOKIE and not os.environ.get("VINTED_COOKIES"):
         return False, "❌ Vinted cookies not configured on Railway."
 
     session = requests.Session()
 
-    # ALWAYS put the cookies on the session first
+    # Always put cookies on the session
     cookies = _vinted_cookies()
     if cookies:
         session.cookies.update(cookies)
@@ -148,8 +175,18 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     if not csrf:
         return False, "❌ Could not get CSRF token. Set VINTED_CSRF_TOKEN or check cookies."
 
-    url = f"{VINTED_BASE}/api/v2/item_transactions"
-    body = {"transaction": {"item_id": int(item_id), "transaction_id": None}}
+    # 1. Get the seller ID
+    seller_id = _get_item_seller_id(session, item_id, csrf)
+    if not seller_id:
+        return False, "❌ Could not get seller ID for this item."
+
+    # 2. Create the conversation / transaction (this is the real reserve step)
+    url = f"{VINTED_BASE}/api/v2/conversations"
+    body = {
+        "initiator": "buy",
+        "item_id": str(item_id),
+        "opposite_user_id": str(seller_id),
+    }
 
     logger.info("Sending reserve request to %s with body %s", url, body)
     logger.info("Cookies being sent: %s", list(session.cookies.keys()))
@@ -174,22 +211,27 @@ def reserve_vinted_item(item_id: str) -> tuple[bool, str]:
     if resp.status_code in (200, 201):
         try:
             data = resp.json()
-            tx_id = (data.get("transaction") or {}).get("id") or data.get("id") or "unknown"
+            conversation = data.get("conversation") or {}
+            transaction = conversation.get("transaction") or {}
+            tx_id = transaction.get("id") or "unknown"
+
             return True, (
-                f"✅ Reserved! Transaction id `{tx_id}`.\n"
-                "Open the Vinted app → **Wallet & Purchases → Ongoing** and pay within ~15 min."
+                f"✅ Reserved / transaction started!\n"
+                f"Transaction ID: `{tx_id}`\n"
+                f"Open the Vinted app → **Inbox** or **Wallet & Purchases → Ongoing** "
+                f"and complete payment."
             )
-        except ValueError:
-            return True, "✅ Reserved (OK response)."
+        except Exception:
+            return True, "✅ Request succeeded (check your Vinted app)."
 
     if resp.status_code == 401:
-        return False, "❌ Session cookie rejected (401). Log in again and update cookies."
+        return False, "❌ Session cookie rejected (401). Update your cookies."
     if resp.status_code == 403:
-        return False, "❌ Forbidden (403). CSRF invalid or Cloudflare/DataDome blocked."
+        return False, "❌ Forbidden (403). CSRF invalid or blocked."
     if resp.status_code == 404:
-        return False, "❌ Endpoint returned 404 (item sold **or** wrong endpoint)."
+        return False, "❌ Item not found or already sold (404)."
     if resp.status_code == 409:
-        return False, "❌ Item already sold/reserved by someone else (409)."
+        return False, "❌ Item already reserved/sold (409)."
     if resp.status_code == 422:
         return False, f"❌ Rejected (422): {resp.text[:300]}"
     if resp.status_code == 429:
@@ -283,7 +325,7 @@ async def on_message(message: discord.Message):
 
     try:
         await message.reply(
-            content=f"⚡ Tap below to reserve `#{item_id}` (holds ~15 min for payment):",
+            content=f"⚡ Tap below to reserve `#{item_id}`:",
             view=ReserveView(item_id=item_id, listing_url=listing_url),
             mention_author=False,
         )
